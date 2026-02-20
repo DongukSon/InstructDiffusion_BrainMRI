@@ -26,7 +26,7 @@ from ldm.modules.distributions.distributions import normal_kl, DiagonalGaussianD
 from ldm.models.autoencoder import VQModelInterface, IdentityFirstStage, AutoencoderKL
 from ldm.modules.diffusionmodules.util import make_beta_schedule, extract_into_tensor, noise_like
 from ldm.models.diffusion.ddim import DDIMSampler
-from timm.models.layers import trunc_normal_
+from timm.layers import trunc_normal_
 
 
 __conditioning_keys__ = {'concat': 'c_concat',
@@ -170,7 +170,7 @@ class DDPM(nn.Module):
 
     def init_from_ckpt(self, path, ignore_keys=list(), only_model=False):
         if os.path.exists(path):
-            sd = torch.load(path, map_location="cpu")
+            sd = torch.load(path, map_location="cpu", weights_only=True)
             if "state_dict" in list(sd.keys()):
                 sd = sd["state_dict"]
             keys = list(sd.keys())
@@ -586,7 +586,7 @@ class LatentDiffusion(DDPM):
     # @torch.no_grad()
     def get_input(self, batch, k, return_first_stage_outputs=False, force_c_encode=False,
                   cond_key=None, return_original_cond=False, bs=None, uncond=0.05):
-        x = super().get_input(batch, k)
+        x = super().get_input(batch, k) # k = "edited", dict(edited=label, edit=dict(c_concat=image, c_crossattn=instruction))
         if bs is not None:
             x = x[:bs]
         encoder_posterior = self.encode_first_stage(x)
@@ -603,7 +603,12 @@ class LatentDiffusion(DDPM):
         input_mask = 1 - rearrange((random >= 0.075).float() * (random < 0.15).float(), "n -> n 1 1 1")
         
         null_prompt = self.get_learned_conditioning([""])
-        cond["c_crossattn"] = [torch.where(prompt_mask, null_prompt, self.get_learned_conditioning(xc["c_crossattn"]).detach())]
+        c_crossattn_encoded = self.get_learned_conditioning(xc["c_crossattn"])
+        
+        if not self.cond_stage_trainable:
+            c_crossattn_encoded = c_crossattn_encoded.detach()
+        cond["c_crossattn"] = [torch.where(prompt_mask, null_prompt, c_crossattn_encoded)]
+        # cond["c_crossattn"] = [torch.where(prompt_mask, null_prompt, self.get_learned_conditioning(xc["c_crossattn"]).detach())]
         cond["c_concat"] = [input_mask * self.encode_first_stage((xc["c_concat"])).mode().detach()]
 
         out = [z, cond]
@@ -779,8 +784,8 @@ class LatentDiffusion(DDPM):
         t = torch.randint(0, self.num_timesteps, (x.shape[0],), device=x.device).long()
         if self.model.conditioning_key is not None:
             assert c is not None
-            if self.cond_stage_trainable:
-                c = self.get_learned_conditioning(c)
+            # if self.cond_stage_trainable:
+            #     c = self.get_learned_conditioning(c)
             if self.shorten_cond_schedule:  # TODO: drop this option
                 tc = self.cond_ids[t]
                 c = self.q_sample(x_start=c, t=tc, noise=torch.randn_like(c.float()))
@@ -1172,7 +1177,17 @@ class LatentDiffusion(DDPM):
                                                  return_intermediates=True,**kwargs)
 
         return samples, intermediates
-
+    
+    def configure_optimizers(self):
+        lr = self.learning_rate
+        params = list(self.model.parameters())
+        if self.cond_stage_trainable:
+            print(f"{self.__class__.__name__}: Also optimizing conditioner params!")
+            params += list(self.cond_stage_model.parameters())
+        if hasattr(self, "learn_logvar") and self.learn_logvar:
+            params.append(self.logvar)
+        opt = torch.optim.AdamW(params, lr=lr)
+        return opt, None
 
 class DiffusionWrapper(nn.Module):
     def __init__(self, diff_model_config, conditioning_key):

@@ -28,6 +28,7 @@ sys.path.append("./stable_diffusion")
 
 from stable_diffusion.ldm.util import instantiate_from_config
 
+import scipy.io
 
 class CFGDenoiser(nn.Module):
     def __init__(self, model):
@@ -70,11 +71,33 @@ def main():
     parser.add_argument("--vae-ckpt", default=None, type=str)
     parser.add_argument("--input", required=True, type=str)
     parser.add_argument("--outdir", default="logs", type=str)
-    parser.add_argument("--edit", required=True, type=str)
+    parser.add_argument("--edit", required=False, type=str)
     parser.add_argument("--cfg-text", default=5.0, type=float)
     parser.add_argument("--cfg-image", default=1.25, type=float)
     parser.add_argument("--seed", type=int)
+
     args = parser.parse_args()
+
+    # If --edit is not provided, try to get instruction from .mat file
+    edit_instruction = args.edit
+    mat_data = None
+    if edit_instruction is None:
+        if args.input.endswith(".mat"):
+            mat_data = scipy.io.loadmat(args.input)
+            if 'instruction' in mat_data:
+                # instruction is usually a numpy array of shape (1,) and dtype object or string
+                instr = mat_data['instruction']
+                if isinstance(instr, np.ndarray) and instr.shape == (1,):
+                    edit_instruction = str(instr[0])
+                else:
+                    edit_instruction = str(instr)
+            else:
+                raise ValueError("No --edit argument provided and 'instruction' key not found in .mat file.")
+        else:
+            raise ValueError("No --edit argument provided and input is not a .mat file.")
+    else:
+        if args.input.endswith(".mat"):
+            mat_data = scipy.io.loadmat(args.input)
 
     config = OmegaConf.load(args.config)
     model = load_model_from_config(config, args.ckpt, args.vae_ckpt)
@@ -86,7 +109,11 @@ def main():
 
     seed = random.randint(0, 100000) if args.seed is None else args.seed
 
-    if args.input.startswith("http"):
+    if args.input.endswith(".mat"):
+        if mat_data is None:
+            mat_data = scipy.io.loadmat(args.input)
+        input_image = Image.fromarray(mat_data['image']).convert("RGB")
+    elif args.input.startswith("http"):
         input_image = Image.open(requests.get(args.input, stream=True).raw).convert("RGB")
     else:
         input_image = Image.open(args.input).convert("RGB")
@@ -101,7 +128,7 @@ def main():
     os.makedirs(output_dir, exist_ok=True)
     with torch.no_grad(), autocast("cuda"):
         cond = {}
-        cond["c_crossattn"] = [model.get_learned_conditioning([args.edit])]
+        cond["c_crossattn"] = [model.get_learned_conditioning([edit_instruction])]
         input_image = 2 * torch.tensor(np.array(input_image)).float() / 255 - 1
         input_image = rearrange(input_image, "h w c -> 1 c h w").to(next(model.parameters()).device)
         cond["c_concat"] = [model.encode_first_stage(input_image).mode()]

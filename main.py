@@ -34,6 +34,7 @@ from utils.logger import create_logger
 from utils.utils import load_checkpoint, save_checkpoint, get_grad_norm, auto_resume_helper
 from utils.deepspeed import create_ds_config
 
+from stable_diffusion.main import worker_init_fn
 
 def wandb_log(*args, **kwargs):
     if dist.get_rank() == 0:
@@ -182,15 +183,27 @@ class DataModuleFromConfig():
             else:
                 for ds in train:
                     ds_name = str([key for key in ds.keys()][0])
-                    self.dataset_configs[ds_name] = ds
+                    self.dataset_configs[f"train_{ds_name}"] = ds
                 self.train_dataloader = self._train_concat_dataloader
 
         if validation is not None:
-            self.dataset_configs["validation"] = validation
-            self.val_dataloader = partial(self._val_dataloader, shuffle=shuffle_val_dataloader)
+            if "target" in validation:
+                self.dataset_configs["validation"] = validation
+                self.val_dataloader = partial(self._val_dataloader, shuffle=shuffle_val_dataloader)
+            else:
+                for ds in validation:
+                    ds_name = str([key for key in ds.keys()][0])
+                    self.dataset_configs[f"val_{ds_name}"] = ds
+                self.val_dataloader = partial(self._val_concat_dataloader, shuffle=shuffle_val_dataloader)
         if test is not None:
-            self.dataset_configs["test"] = test
-            self.test_dataloader = partial(self._test_dataloader, shuffle=shuffle_test_loader)
+            if "target" in test:
+                self.dataset_configs["test"] = test
+                self.test_dataloader = partial(self._test_dataloader, shuffle=shuffle_test_loader)
+            else:
+                for ds in test:
+                    ds_name = str([key for key in ds.keys()][0])
+                    self.dataset_configs[f"test_{ds_name}"] = ds
+                self.test_dataloader = partial(self._test_concat_dataloader, shuffle=shuffle_test_loader)
         if predict is not None:
             self.dataset_configs["predict"] = predict
             self.predict_dataloader = self._predict_dataloader
@@ -209,7 +222,7 @@ class DataModuleFromConfig():
                 self.datasets[k] = WrappedDataset(self.datasets[k])
 
     def _train_concat_dataloader(self):
-        is_iterable_dataset = isinstance(self.datasets['ds1'], Txt2ImgIterableBaseDataset)
+        is_iterable_dataset = isinstance(self.datasets.get('train_ds1'), Txt2ImgIterableBaseDataset) if 'train_ds1' in self.datasets else False
 
         if is_iterable_dataset or self.use_worker_init_fn:
             init_fn = worker_init_fn
@@ -218,7 +231,8 @@ class DataModuleFromConfig():
 
         concat_dataset = []
         for ds in self.datasets.keys():
-            concat_dataset.append(self.datasets[ds])
+            if ds.startswith('train_'):
+                concat_dataset.append(self.datasets[ds])
 
         concat_dataset = ConcatDataset(concat_dataset)
         sampler_train = torch.utils.data.DistributedSampler(
@@ -249,10 +263,28 @@ class DataModuleFromConfig():
                           batch_size=self.batch_size,
                           num_workers=self.num_workers,
                           worker_init_fn=init_fn,
-                          shuffle=shuffle, persistent_workers=True)
+                          shuffle=shuffle, persistent_workers=False)
+
+    def _val_concat_dataloader(self, shuffle=False):
+        is_iterable_dataset = isinstance(self.datasets.get('val_ds1'), Txt2ImgIterableBaseDataset) if 'val_ds1' in self.datasets else False
+
+        if is_iterable_dataset or self.use_worker_init_fn:
+            init_fn = worker_init_fn
+        else:
+            init_fn = None
+
+        concat_dataset = []
+        for ds in self.datasets.keys():
+            if ds.startswith('val_'):
+                concat_dataset.append(self.datasets[ds])
+
+        concat_dataset = ConcatDataset(concat_dataset)
+        return DataLoader(concat_dataset, batch_size=self.batch_size,
+                          num_workers=self.num_workers, worker_init_fn=init_fn, 
+                          shuffle=shuffle, persistent_workers=False)
 
     def _test_dataloader(self, shuffle=False):
-        is_iterable_dataset = isinstance(self.datasets['train'], Txt2ImgIterableBaseDataset)
+        is_iterable_dataset = isinstance(self.datasets['test'], Txt2ImgIterableBaseDataset)
         if is_iterable_dataset or self.use_worker_init_fn:
             init_fn = worker_init_fn
         else:
@@ -262,7 +294,28 @@ class DataModuleFromConfig():
         shuffle = shuffle and (not is_iterable_dataset)
 
         return DataLoader(self.datasets["test"], batch_size=self.batch_size,
-                          num_workers=self.num_workers, worker_init_fn=init_fn, shuffle=shuffle, persistent_workers=True)
+                          num_workers=self.num_workers, worker_init_fn=init_fn, shuffle=shuffle, persistent_workers=False)
+
+    def _test_concat_dataloader(self, shuffle=False):
+        is_iterable_dataset = isinstance(self.datasets.get('test_ds1'), Txt2ImgIterableBaseDataset) if 'test_ds1' in self.datasets else False
+
+        if is_iterable_dataset or self.use_worker_init_fn:
+            init_fn = worker_init_fn
+        else:
+            init_fn = None
+
+        concat_dataset = []
+        for ds in self.datasets.keys():
+            if ds.startswith('test_'):
+                concat_dataset.append(self.datasets[ds])
+
+        concat_dataset = ConcatDataset(concat_dataset)
+        # do not shuffle dataloader for iterable dataset
+        shuffle = shuffle and (not is_iterable_dataset)
+
+        return DataLoader(concat_dataset, batch_size=self.batch_size,
+                          num_workers=self.num_workers, worker_init_fn=init_fn, 
+                          shuffle=shuffle, persistent_workers=False)
 
     def _predict_dataloader(self, shuffle=False):
         if isinstance(self.datasets['predict'], Txt2ImgIterableBaseDataset) or self.use_worker_init_fn:
@@ -270,7 +323,7 @@ class DataModuleFromConfig():
         else:
             init_fn = None
         return DataLoader(self.datasets["predict"], batch_size=self.batch_size,
-                          num_workers=self.num_workers, worker_init_fn=init_fn, persistent_workers=True)
+                          num_workers=self.num_workers, worker_init_fn=init_fn, persistent_workers=False)
 
 
 def train_one_epoch(config, model, model_ema, data_loader, val_data_loader, optimizer, epoch, lr_scheduler, scaler):
@@ -305,7 +358,7 @@ def train_one_epoch(config, model, model_ema, data_loader, val_data_loader, opti
 
             loss_number = loss.item()
         else:
-            with amp.autocast(enabled=config.model.params.fp16):
+            with torch.autocast(enabled=config.model.params.fp16):
                 loss, _ = model(batch, idx, accumul_steps)
 
             if config.trainer.accumulate_grad_batches > 1:
@@ -353,7 +406,8 @@ def train_one_epoch(config, model, model_ema, data_loader, val_data_loader, opti
         batch_time.update(time.time() - end)
         end = time.time()
         
-        if idx % 100 == 0:
+        interval = 50
+        if idx % interval == 0:
             lr = optimizer.param_groups[0]['lr']
             memory_used = torch.cuda.max_memory_allocated() / (1024.0 * 1024.0)
             etas = batch_time.avg * (num_steps - idx)
@@ -366,7 +420,7 @@ def train_one_epoch(config, model, model_ema, data_loader, val_data_loader, opti
                 f'loss_scale {loss_scale_meter.val:.4f} ({loss_scale_meter.avg:.4f})\t'
                 f'mem {memory_used:.0f}MB')
 
-        if (epoch * num_steps + idx) % 100 == 0:
+        if (epoch * num_steps + idx) % interval == 0:
             log_message = dict(
                 lr=optimizer.param_groups[0]['lr'], 
                 time=batch_time.val, 
@@ -403,6 +457,13 @@ def train_one_epoch(config, model, model_ema, data_loader, val_data_loader, opti
                             f'loss {val_loss_meter.val:.4f} ({val_loss_meter.avg:.4f})\t')
                     if val_idx == 50:
                         break
+                wandb_log(
+                    data={
+                        "val/loss_epoch_avg": val_loss_meter.avg,
+                        "epoch": epoch
+                    },
+                    step = epoch * num_steps + idx
+                )
                 model_ema.restore(model.parameters())
 
     epoch_time = time.time() - start
@@ -472,7 +533,7 @@ if __name__ == "__main__":
         )
 
     logger = create_logger(output_dir=logdir, dist_rank=dist.get_rank(), name=f"{nowname}")
-    
+
     resume_file = auto_resume_helper(config, ckptdir)
     if resume_file:
         resume = True
@@ -522,7 +583,7 @@ if __name__ == "__main__":
         model.cuda()
 
     if config.model.params.fp16 and config.model.params.deepspeed == '':
-        scaler = amp.GradScaler()
+        scaler = torch.GradScaler()
         param_groups = model.parameters()
     else:
         scaler = None
